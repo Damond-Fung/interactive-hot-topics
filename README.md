@@ -109,6 +109,24 @@ python interactive_hot_topics_report.py \
 python .trae/skills/interactive-hot-topics-report/resources/scripts/generate_interactive_hot_topics_report.py
 ```
 
+## 在其他 AI 工具 / 无 Agent 环境下使用 CLI
+
+如果当前环境无法驱动宿主 Agent 自动逐帖回填（其他 IDE、其他 AI 客户端、CI、纯 shell），可使用统一 CLI 入口 `interactive_hot_topics_cli.py`，把“采集 → AI 判别 → 最终汇总”封装为一行命令：
+
+```bash
+python interactive_hot_topics_cli.py run \
+  --time-preset last-week \
+  --llm-provider github
+```
+
+子命令一览：
+
+- `report`：仅采集导出底表（保留 AI 模板）
+- `analyze --ai-results <path>`：基于已有结果重算最终汇总
+- `run`：一键完成全流程，默认 `--ai-mode api`
+
+CLI 内部调用 `interactive_hot_topics_report.py`，所有窗口参数与 LLM 参数完全一致，不重复实现。
+
 ## 推荐流程
 
 1. 先导出底表，确认采集范围和时间窗口正确。

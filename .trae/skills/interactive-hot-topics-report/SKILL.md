@@ -294,6 +294,38 @@ python .trae/skills/interactive-hot-topics-report/resources/scripts/generate_int
 
 如果使用 GitHub Models，默认读取环境变量 `GITHUB_TOKEN`；如果使用 OpenAI，默认读取 `OPENAI_API_KEY`。
 
+### 在其他 AI 工具 / 无 Agent 闭环环境下的 CLI 用法
+
+为方便在不能驱动宿主 Agent 自动回填的环境（其他 IDE、其他 AI 客户端、CI、纯 shell）里依然可以一键跑完“采集 → AI 判别 → 最终汇总”，仓库提供了统一 CLI 入口 `interactive_hot_topics_cli.py`，包含三个子命令：
+
+- `report`：仅采集导出底表（等价于强制 `--ai-mode agent --export-ai-template`）
+- `analyze`：基于已有 `ai_results.json` 重算最终汇总
+- `run`：一键完成 `采集 + 逐帖 AI 判别 + 最终回填`，默认走 `--ai-mode api`
+
+一键模式（推荐在“其他 AI 工具”里使用，无需 Agent 回调）：
+
+```bash
+python interactive_hot_topics_cli.py run \
+  --time-preset last-week \
+  --llm-provider github
+```
+
+仅导出底表（保留模板供后续宿主 Agent 回填）：
+
+```bash
+python interactive_hot_topics_cli.py report --time-preset last-week
+```
+
+回填已有 AI 结果：
+
+```bash
+python interactive_hot_topics_cli.py analyze \
+  --time-preset last-week \
+  --ai-results ./exports/interactive_hot_topics_ai_results_20260518-20260524.json
+```
+
+CLI 内部仍调用 `interactive_hot_topics_report.py`，所有窗口参数（`--time-preset`、`--start-date/--end-date`、`--top-n`、`--max-pages`、`--output` 等）与模型参数（`--llm-provider`、`--llm-model`、`--llm-base-url`、`--llm-api-key-env`、`--llm-timeout`、`--llm-max-retries`、`--llm-max-topics`）保持一致，不重复实现。
+
 指定自定义日期：
 
 ```bash
