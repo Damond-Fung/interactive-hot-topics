@@ -9,6 +9,11 @@ description: "Generates an interactive-discussion hot topics Excel report for th
 
 该 Skill 与“社区之星：活力之星”完全分开，只处理 `互动交流` 板块的热门讨论汇总、逐帖 AI 判别回填、Excel/JSON 导出。
 
+当前 Skill 支持双模式：
+
+- `模式 A / Agent 模式`：优先由宿主 Agent 读取 `analysis_packets`，逐帖完成语义判别，再回填正式 `ai_results.json`
+- `模式 B / API 模式`：如果当前 Agent 不支持继续逐帖分析、不能稳定写回 JSON 或不能二次回填，则自动改走脚本内模型 API 判别
+
 ## 何时调用
 
 只要用户明确在问 `互动交流` 板块，并且目标属于“逐帖理解后再汇总”的报告场景，就应优先调用本 Skill。
@@ -151,6 +156,13 @@ JSON 重点字段至少包含：
 
 ## AI 回填规则
 
+双模式默认路由：
+
+1. 优先尝试 `模式 A / Agent 模式`
+2. 如果用户已经提供 `ai_results.json`，直接视为正式回填
+3. 如果当前宿主不支持逐帖 AI 判别或无法自动回填，则立即切换到 `模式 B / API 模式`
+4. 如果两种模式都不可用，才停留在“底表与待判别状态”
+
 如果用户只需要底表：
 
 - 使用 `--export-ai-template`
@@ -169,6 +181,49 @@ JSON 重点字段至少包含：
 - 不输出伪造的最终 AI 热点榜单
 
 如果用户已经上传或提供了 `ai_results.json`，则应视为“正式回填模式”，优先重新生成最终版汇总，而不是继续展示底表占位结果。
+
+### 模式 A：Agent 模式
+
+适用条件：
+
+- 当前宿主支持在执行脚本后继续读取导出的 `.json`
+- 当前宿主支持批量逐帖分析 `analysis_packets`
+- 当前宿主支持落盘 `ai_results.json`
+- 当前宿主支持再次执行脚本并传入 `--ai-results`
+
+执行要求：
+
+1. 先导出底表，确保 `analysis_packets` 已生成
+2. 逐条读取 `agent_analysis_input`
+3. 基于标题和全帖内容做语义判别
+4. 回填正式 `ai_results.json`
+5. 再用 `--ai-results` 重新生成最终版 Excel/JSON
+
+### 模式 B：API 模式
+
+触发条件：
+
+- 当前宿主不会自动触发逐帖 AI 分析
+- 当前宿主不能稳定回填 `ai_results.json`
+- 用户明确要求“直接自动调用模型完成判别”
+- 已配置可用的模型 API 凭据
+
+脚本参数：
+
+- `--ai-mode auto|agent|api`
+- `--llm-provider github|openai|custom`
+- `--llm-base-url`
+- `--llm-model`
+- `--llm-api-key-env`
+- `--llm-timeout`
+- `--llm-max-retries`
+- `--llm-max-topics`
+
+默认行为：
+
+- `--ai-mode auto`：优先等待 Agent 结果；若已存在可用的 API 配置，则直接走脚本 API 判别并自动生成 `.auto-ai-results.json`
+- `--ai-mode agent`：只导出底表 / 模板，等待 Agent 回填
+- `--ai-mode api`：强制走脚本 API 判别
 
 推荐执行顺序：
 
@@ -204,6 +259,14 @@ python .trae/skills/interactive-hot-topics-report/resources/scripts/generate_int
   --top-n 5
 ```
 
+自动路由模式：
+
+```bash
+python .trae/skills/interactive-hot-topics-report/resources/scripts/generate_interactive_hot_topics_report.py \
+  --time-preset last-week \
+  --ai-mode auto
+```
+
 导出 AI 模板：
 
 ```bash
@@ -219,6 +282,17 @@ python .trae/skills/interactive-hot-topics-report/resources/scripts/generate_int
   --time-preset last-week \
   --ai-results ./exports/interactive_hot_topics_ai_results_20260518-20260524.json
 ```
+
+API 模式直连模型：
+
+```bash
+python .trae/skills/interactive-hot-topics-report/resources/scripts/generate_interactive_hot_topics_report.py \
+  --time-preset last-week \
+  --ai-mode api \
+  --llm-provider github
+```
+
+如果使用 GitHub Models，默认读取环境变量 `GITHUB_TOKEN`；如果使用 OpenAI，默认读取 `OPENAI_API_KEY`。
 
 指定自定义日期：
 
@@ -252,6 +326,11 @@ python .trae/skills/interactive-hot-topics-report/resources/scripts/generate_int
 
 - 明确说明当前结果仍是底表与待判别状态
 - 不要把占位结果冒充最终语义总结
+
+如果 `模式 B / API 模式` 缺少必要配置：
+
+- 明确提示缺少的模型参数或凭据环境变量
+- 不要假装已经完成自动 AI 判别
 
 ## 示例请求
 

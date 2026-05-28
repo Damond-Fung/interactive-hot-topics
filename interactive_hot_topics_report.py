@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import time as time_module
 from collections import Counter
@@ -25,6 +26,13 @@ DEFAULT_FORUM_BASE_URL = "https://forum.trae.cn"
 DEFAULT_TIMEZONE = "Asia/Shanghai"
 DEFAULT_OUTPUT_DIR = "exports"
 USER_AGENT = "interactive-hot-topics-report/1.0"
+DEFAULT_AI_MODE = "auto"
+DEFAULT_LLM_PROVIDER = "github"
+DEFAULT_GITHUB_MODELS_URL = "https://models.github.ai/inference/chat/completions"
+DEFAULT_GITHUB_API_VERSION = "2026-03-10"
+DEFAULT_GITHUB_MODEL = "openai/gpt-4.1-mini"
+DEFAULT_OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
+DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 INTERACTIVE_CATEGORY_ID = 11
 INTERACTIVE_CATEGORY_NAME = "互动交流"
 CHINESE_STOPWORDS = {
@@ -118,6 +126,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-pages", type=int, default=30)
     parser.add_argument("--ai-results", help="Optional JSON file that contains AI analysis results keyed by topic_id.")
     parser.add_argument("--export-ai-template", action="store_true", help="Export an AI results template JSON next to the report.")
+    parser.add_argument("--ai-mode", choices=["auto", "agent", "api"], default=DEFAULT_AI_MODE)
+    parser.add_argument("--llm-provider", choices=["github", "openai", "custom"], default=DEFAULT_LLM_PROVIDER)
+    parser.add_argument("--llm-base-url", help="Chat completions endpoint for API mode.")
+    parser.add_argument("--llm-model", help="Model ID for API mode.")
+    parser.add_argument("--llm-api-key-env", help="Environment variable name that stores the API key.")
+    parser.add_argument("--llm-timeout", type=int, default=120, help="Timeout in seconds for each API request in API mode.")
+    parser.add_argument("--llm-max-retries", type=int, default=3, help="Retry count for each API request in API mode.")
+    parser.add_argument("--llm-max-topics", type=int, help="Optional limit for how many topics to analyze in API mode.")
     return parser.parse_args()
 
 
@@ -374,6 +390,27 @@ def request_json(url: str, *, retries: int = 3, timeout: int = 30) -> dict[str, 
     raise RuntimeError(f"Failed to fetch JSON from {url}")
 
 
+def post_json(url: str, payload: dict[str, Any], *, headers: dict[str, str], retries: int = 3, timeout: int = 120) -> dict[str, Any]:
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    last_error: Exception | None = None
+    for attempt in range(retries):
+        req = Request(url, data=body, headers=headers, method="POST")
+        try:
+            with urlopen(req, timeout=timeout) as resp:
+                return json.load(resp)
+        except HTTPError as exc:
+            last_error = exc
+        except URLError as exc:
+            last_error = exc
+
+        if attempt < retries - 1:
+            time_module.sleep(min(2 * (attempt + 1), 8))
+
+    if last_error:
+        raise last_error
+    raise RuntimeError(f"Failed to post JSON to {url}")
+
+
 def build_listing_url(source_url: str, page: int, order: str) -> str:
     parsed = urlparse(source_url)
     path = parsed.path.rstrip("/")
@@ -544,6 +581,213 @@ def build_empty_ai_result_template(packet: dict[str, Any]) -> dict[str, Any]:
         "ai_core_summary": "",
         "notes": "",
     }
+
+
+def default_llm_api_key_env(provider: str) -> str:
+    if provider == "github":
+        return "GITHUB_TOKEN"
+    if provider == "openai":
+        return "OPENAI_API_KEY"
+    return "LLM_API_KEY"
+
+
+def default_llm_base_url(provider: str) -> str:
+    if provider == "github":
+        return DEFAULT_GITHUB_MODELS_URL
+    if provider == "openai":
+        return DEFAULT_OPENAI_CHAT_URL
+    return ""
+
+
+def default_llm_model(provider: str) -> str:
+    if provider == "github":
+        return DEFAULT_GITHUB_MODEL
+    if provider == "openai":
+        return DEFAULT_OPENAI_MODEL
+    return ""
+
+
+def resolve_llm_settings(args: argparse.Namespace) -> dict[str, Any]:
+    provider = args.llm_provider
+    api_key_env = args.llm_api_key_env or default_llm_api_key_env(provider)
+    api_key = os.environ.get(api_key_env, "").strip()
+    base_url = (args.llm_base_url or default_llm_base_url(provider)).strip()
+    model = (args.llm_model or default_llm_model(provider)).strip()
+    return {
+        "provider": provider,
+        "base_url": base_url,
+        "model": model,
+        "api_key_env": api_key_env,
+        "api_key": api_key,
+        "timeout": max(30, int(args.llm_timeout)),
+        "retries": max(1, int(args.llm_max_retries)),
+        "max_topics": args.llm_max_topics,
+    }
+
+
+def llm_settings_ready(settings: dict[str, Any]) -> bool:
+    return bool(settings["base_url"] and settings["model"] and settings["api_key"])
+
+
+def build_ai_response_schema() -> dict[str, Any]:
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "interactive_hot_topic_analysis",
+            "schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "topic_id": {"type": "integer"},
+                    "ai_topic_category": {"type": "string"},
+                    "ai_is_negative_feedback": {"type": "string", "enum": ["是", "否"]},
+                    "ai_is_product_suggestion": {"type": "string", "enum": ["是", "否"]},
+                    "ai_core_summary": {"type": "string"},
+                    "notes": {"type": "string"},
+                },
+                "required": [
+                    "topic_id",
+                    "ai_topic_category",
+                    "ai_is_negative_feedback",
+                    "ai_is_product_suggestion",
+                    "ai_core_summary",
+                    "notes",
+                ],
+            },
+        },
+    }
+
+
+def build_api_analysis_messages(packet: dict[str, Any]) -> list[dict[str, str]]:
+    developer_prompt = "\n".join(
+        [
+            "你是 TRAE 论坛“互动交流”板块的逐帖分析助手。",
+            "你只能基于标题和全帖内容做真实语义判断，不要依据标签，不要做机械关键词归类。",
+            "请输出一个 JSON 对象，并严格遵守给定 schema。",
+            "字段要求：",
+            "1. ai_topic_category: 话题核心主题，优先给 1 个主类，必要时最多 2 个，用 `、` 分隔。",
+            "2. ai_is_negative_feedback: 仅返回 `是` 或 `否`。",
+            "3. ai_is_product_suggestion: 仅返回 `是` 或 `否`。",
+            "4. ai_core_summary: 用一句中文概括核心表达。",
+            "5. notes: 简短说明你的判断依据，可留空。",
+        ]
+    )
+    return [
+        {"role": "developer", "content": developer_prompt},
+        {"role": "user", "content": packet["agent_analysis_input"]},
+    ]
+
+
+def extract_message_content(message: Any) -> str:
+    if isinstance(message, str):
+        return message
+    if isinstance(message, list):
+        parts: list[str] = []
+        for item in message:
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("content") or ""
+                if text:
+                    parts.append(str(text))
+        return "\n".join(parts).strip()
+    return ""
+
+
+def parse_json_object_text(content: str) -> dict[str, Any]:
+    text = content.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    return json.loads(text)
+
+
+def normalize_ai_result_record(packet: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "topic_id": int(payload.get("topic_id") or packet["topic_id"]),
+        "title": packet["title"],
+        "topic_url": packet["topic_url"],
+        "ai_topic_category": str(payload.get("ai_topic_category") or "").strip(),
+        "ai_is_negative_feedback": "是" if str(payload.get("ai_is_negative_feedback") or "").strip() == "是" else "否",
+        "ai_is_product_suggestion": "是" if str(payload.get("ai_is_product_suggestion") or "").strip() == "是" else "否",
+        "ai_core_summary": str(payload.get("ai_core_summary") or "").strip(),
+        "notes": str(payload.get("notes") or "").strip(),
+    }
+
+
+def call_llm_for_packet(packet: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
+    payload = {
+        "model": settings["model"],
+        "messages": build_api_analysis_messages(packet),
+        "response_format": build_ai_response_schema(),
+        "temperature": 0.2,
+    }
+    headers = {
+        "Authorization": f"Bearer {settings['api_key']}",
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+    if settings["provider"] == "github":
+        headers["Accept"] = "application/vnd.github+json"
+        headers["X-GitHub-Api-Version"] = DEFAULT_GITHUB_API_VERSION
+    else:
+        headers["Accept"] = "application/json"
+
+    response = post_json(
+        settings["base_url"],
+        payload,
+        headers=headers,
+        retries=settings["retries"],
+        timeout=settings["timeout"],
+    )
+    choices = response.get("choices") or []
+    if not choices:
+        raise RuntimeError(f"LLM response missing choices for topic {packet['topic_id']}")
+    message = choices[0].get("message") or {}
+    content = extract_message_content(message.get("content"))
+    if not content:
+        raise RuntimeError(f"LLM response missing message content for topic {packet['topic_id']}")
+    parsed = parse_json_object_text(content)
+    return normalize_ai_result_record(packet, parsed)
+
+
+def generate_ai_results_via_api(report: dict[str, Any], args: argparse.Namespace, output_path: Path, json_path: Path) -> tuple[dict[int, dict[str, Any]], Path]:
+    settings = resolve_llm_settings(args)
+    if not llm_settings_ready(settings):
+        missing: list[str] = []
+        if not settings["base_url"]:
+            missing.append("--llm-base-url")
+        if not settings["model"]:
+            missing.append("--llm-model")
+        if not settings["api_key"]:
+            missing.append(settings["api_key_env"])
+        raise ValueError(f"API 模式缺少必要配置：{', '.join(missing)}")
+
+    packets = report["analysis_packets"]
+    if settings["max_topics"]:
+        packets = packets[: max(0, int(settings["max_topics"]))]
+
+    results: list[dict[str, Any]] = []
+    for index, packet in enumerate(packets, start=1):
+        result = call_llm_for_packet(packet, settings)
+        result["notes"] = (result.get("notes") or "").strip() or f"api-mode:{settings['provider']}"
+        results.append(result)
+        if index < len(packets):
+            time_module.sleep(0.2)
+
+    auto_results_path = output_path.with_name(output_path.stem + ".auto-ai-results.json")
+    payload = {
+        "meta": {
+            "source_excel": str(output_path),
+            "source_json": str(json_path),
+            "analysis_source": "script-api-fallback",
+            "provider": settings["provider"],
+            "model": settings["model"],
+            "api_key_env": settings["api_key_env"],
+            "topic_count": len(results),
+        },
+        "results": results,
+    }
+    auto_results_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {int(item["topic_id"]): item for item in results}, auto_results_path
 
 
 def build_seed_ai_result(packet: dict[str, Any]) -> dict[str, Any]:
@@ -1168,10 +1412,15 @@ def serialize_report(report: dict[str, Any]) -> dict[str, Any]:
         "detail_rows": report["detail_rows"],
         "analysis_packets": report["analysis_packets"],
         "ai_workflow": {
-            "analysis_source": "current-agent",
+            "analysis_source": report.get("analysis_source", "current-agent"),
             "topic_input_scope": "title-and-full-thread",
             "ai_results_applied": report.get("ai_results_applied", False),
             "ai_results_count": report.get("ai_results_count", 0),
+            "ai_mode_requested": report.get("ai_mode_requested", DEFAULT_AI_MODE),
+            "ai_mode_resolved": report.get("ai_mode_resolved", "agent-pending"),
+            "auto_ai_results_path": report.get("auto_ai_results_path", ""),
+            "llm_provider": report.get("llm_provider", ""),
+            "llm_model": report.get("llm_model", ""),
             "expected_fields": [
                 "ai_topic_category",
                 "ai_is_negative_feedback",
@@ -1224,12 +1473,37 @@ def main() -> None:
     report["excel_path"] = str(output_path)
     report["ai_results_applied"] = False
     report["ai_results_count"] = 0
+    report["analysis_source"] = "current-agent"
+    report["ai_mode_requested"] = args.ai_mode
+    report["ai_mode_resolved"] = "agent-pending"
+    report["auto_ai_results_path"] = ""
+    report["llm_provider"] = ""
+    report["llm_model"] = ""
+
+    json_path = output_path.with_suffix(".json")
     ai_results = load_ai_results(args.ai_results)
+    if ai_results:
+        report["ai_mode_resolved"] = "agent-results"
+    elif args.ai_mode == "api":
+        ai_results, auto_results_path = generate_ai_results_via_api(report, args, output_path, json_path)
+        report["analysis_source"] = "script-api-fallback"
+        report["ai_mode_resolved"] = "api"
+        report["auto_ai_results_path"] = str(auto_results_path)
+        report["llm_provider"] = resolve_llm_settings(args)["provider"]
+        report["llm_model"] = resolve_llm_settings(args)["model"]
+    elif args.ai_mode == "auto":
+        settings = resolve_llm_settings(args)
+        if llm_settings_ready(settings):
+            ai_results, auto_results_path = generate_ai_results_via_api(report, args, output_path, json_path)
+            report["analysis_source"] = "script-api-fallback"
+            report["ai_mode_resolved"] = "api-fallback"
+            report["auto_ai_results_path"] = str(auto_results_path)
+            report["llm_provider"] = settings["provider"]
+            report["llm_model"] = settings["model"]
     if ai_results:
         report = apply_ai_results_to_report(report, ai_results, args.top_n)
     write_summary_workbook(report, output_path)
 
-    json_path = output_path.with_suffix(".json")
     json_path.write_text(json.dumps(serialize_report(report), ensure_ascii=False, indent=2), encoding="utf-8")
     if args.export_ai_template:
         template_path = output_path.with_name(output_path.stem + ".ai-template.json")
@@ -1240,7 +1514,9 @@ def main() -> None:
                 "source_excel": str(output_path),
                 "source_json": str(json_path),
                 "topic_input_scope": "title-and-full-thread",
-                "analysis_source": "current-agent",
+                "analysis_source": report.get("analysis_source", "current-agent"),
+                "ai_mode_requested": args.ai_mode,
+                "ai_mode_resolved": report.get("ai_mode_resolved", "agent-pending"),
                 "topic_count": len(templates),
             },
             "results": templates,
@@ -1252,6 +1528,7 @@ def main() -> None:
                 f"- 源 Excel: `{output_path}`",
                 f"- 源 JSON: `{json_path}`",
                 f"- 回填模板: `{template_path}`",
+                "- 双模式说明：优先尝试 Agent 模式；如果当前宿主不支持逐帖 AI 回填，请直接改走脚本 API 模式。",
                 "- 请逐条阅读 `analysis_packets` 中的 `agent_analysis_input`，基于标题和全帖内容做语义判断。",
                 "- 不要依据标签，不要只做关键词匹配。",
                 "- 每条仅回填以下字段：",
@@ -1259,7 +1536,8 @@ def main() -> None:
                 "  - `ai_is_negative_feedback`: 仅填写 `是` 或 `否`。",
                 "  - `ai_is_product_suggestion`: 仅填写 `是` 或 `否`。",
                 "  - `ai_core_summary`: 用一句话概括帖子的核心表达。",
-                "- 回填完成后，将结果保存为 `ai_results.json`，再通过 `--ai-results` 重新生成最终汇总。",
+                "- Agent 模式：回填完成后，将结果保存为 `ai_results.json`，再通过 `--ai-results` 重新生成最终汇总。",
+                "- API 模式：可直接传 `--ai-mode api`，并配置模型参数或环境变量，脚本会自动生成 `.auto-ai-results.json` 并回填最终汇总。",
             ]
         )
         template_path.write_text(json.dumps(template_payload, ensure_ascii=False, indent=2), encoding="utf-8")
