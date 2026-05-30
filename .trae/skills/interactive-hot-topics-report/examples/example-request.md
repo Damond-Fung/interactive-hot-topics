@@ -39,5 +39,6 @@
 
 - 我现在在另一个 AI 工具里，不会自动触发 AI 回填，请直接给我一行 CLI 命令跑完全流程
 - 帮我用 `interactive_hot_topics_cli.py run` 一键生成上周 `互动交流` 的正式报告，模型走 GitHub Models
+- 我不想走第三方 HTTP API，也不想共享自己的 Key，请用 CLI 模式调用我本机的 AI 命令行工具完成逐帖判别
 - 这个环境没有 Agent 闭环，帮我用 CLI 子命令把采集和逐帖 AI 判别都跑掉
 - 只先用 CLI 跑 `report` 子命令导底表，AI 判别我之后再补

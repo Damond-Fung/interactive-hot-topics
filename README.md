@@ -127,6 +127,15 @@ python interactive_hot_topics_cli.py run \
 
 CLI 内部调用 `interactive_hot_topics_report.py`，所有窗口参数与 LLM 参数完全一致，不重复实现。
 
+如果你不希望通过第三方 HTTP API（也不需要共享你的 Key），可以改用外部 AI 命令行工具：
+
+```bash
+python interactive_hot_topics_cli.py run \
+  --time-preset last-week \
+  --ai-mode cli \
+  --ai-cli-command "你的AI命令 {prompt_file}"
+```
+
 ## 推荐流程
 
 1. 先导出底表，确认采集范围和时间窗口正确。

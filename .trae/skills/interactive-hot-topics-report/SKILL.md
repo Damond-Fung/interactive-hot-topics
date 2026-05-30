@@ -210,7 +210,7 @@ JSON 重点字段至少包含：
 
 脚本参数：
 
-- `--ai-mode auto|agent|api`
+- `--ai-mode auto|agent|api|cli`
 - `--llm-provider github|openai|custom`
 - `--llm-base-url`
 - `--llm-model`
@@ -218,12 +218,16 @@ JSON 重点字段至少包含：
 - `--llm-timeout`
 - `--llm-max-retries`
 - `--llm-max-topics`
+- `--ai-cli-command`
+- `--ai-cli-timeout`
+- `--ai-cli-max-retries`
 
 默认行为：
 
 - `--ai-mode auto`：优先等待 Agent 结果；若已存在可用的 API 配置，则直接走脚本 API 判别并自动生成 `.auto-ai-results.json`
 - `--ai-mode agent`：只导出底表 / 模板，等待 Agent 回填
 - `--ai-mode api`：强制走脚本 API 判别
+- `--ai-mode cli`：不走 HTTP API，逐帖调用外部 AI 命令行工具完成判别；账号/额度由使用者自行在 CLI 中配置，不需要共享你的 API Key
 
 推荐执行顺序：
 
@@ -293,6 +297,17 @@ python .trae/skills/interactive-hot-topics-report/resources/scripts/generate_int
 ```
 
 如果使用 GitHub Models，默认读取环境变量 `GITHUB_TOKEN`；如果使用 OpenAI，默认读取 `OPENAI_API_KEY`。
+
+CLI 模式（不走 HTTP API，逐帖调用外部 AI 命令行工具）：
+
+```bash
+python .trae/skills/interactive-hot-topics-report/resources/scripts/generate_interactive_hot_topics_report.py \
+  --time-preset last-week \
+  --ai-mode cli \
+  --ai-cli-command "你的AI命令 {prompt_file}"
+```
+
+`--ai-cli-command` 支持 `{prompt}` / `{prompt_file}`，或不写占位符则通过 stdin 传入。务必确保外部 CLI 只输出一个 JSON 对象。
 
 ### 在其他 AI 工具 / 无 Agent 闭环环境下的 CLI 用法
 

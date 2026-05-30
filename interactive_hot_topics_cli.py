@@ -62,6 +62,12 @@ def _add_common_llm_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--llm-timeout", type=int)
     p.add_argument("--llm-max-retries", type=int)
     p.add_argument("--llm-max-topics", type=int)
+    p.add_argument(
+        "--ai-cli-command",
+        help="External AI CLI command for CLI mode. Supports {prompt} / {prompt_file} placeholders, or stdin if omitted.",
+    )
+    p.add_argument("--ai-cli-timeout", type=int)
+    p.add_argument("--ai-cli-max-retries", type=int)
 
 
 def _collect_forwarded(ns: argparse.Namespace, names: list[str]) -> list[str]:
@@ -98,6 +104,9 @@ LLM_FLAGS = [
     "--llm-timeout",
     "--llm-max-retries",
     "--llm-max-topics",
+    "--ai-cli-command",
+    "--ai-cli-timeout",
+    "--ai-cli-max-retries",
 ]
 
 
@@ -150,7 +159,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_common_window_args(p_run)
     _add_common_llm_args(p_run)
-    p_run.add_argument("--ai-mode", choices=["auto", "api"], default="api")
+    p_run.add_argument("--ai-mode", choices=["auto", "api", "cli"], default="api")
     p_run.set_defaults(func=cmd_run)
 
     return parser

@@ -7,6 +7,10 @@ import argparse
 import json
 import os
 import re
+import shlex
+import shutil
+import subprocess
+import tempfile
 import time as time_module
 from collections import Counter
 from datetime import datetime, time, timedelta, timezone
@@ -33,6 +37,7 @@ DEFAULT_GITHUB_API_VERSION = "2026-03-10"
 DEFAULT_GITHUB_MODEL = "openai/gpt-4.1-mini"
 DEFAULT_OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+DEFAULT_CLI_TIMEOUT = 180
 INTERACTIVE_CATEGORY_ID = 11
 INTERACTIVE_CATEGORY_NAME = "互动交流"
 CHINESE_STOPWORDS = {
@@ -126,7 +131,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-pages", type=int, default=30)
     parser.add_argument("--ai-results", help="Optional JSON file that contains AI analysis results keyed by topic_id.")
     parser.add_argument("--export-ai-template", action="store_true", help="Export an AI results template JSON next to the report.")
-    parser.add_argument("--ai-mode", choices=["auto", "agent", "api"], default=DEFAULT_AI_MODE)
+    parser.add_argument("--ai-mode", choices=["auto", "agent", "api", "cli"], default=DEFAULT_AI_MODE)
     parser.add_argument("--llm-provider", choices=["github", "openai", "custom"], default=DEFAULT_LLM_PROVIDER)
     parser.add_argument("--llm-base-url", help="Chat completions endpoint for API mode.")
     parser.add_argument("--llm-model", help="Model ID for API mode.")
@@ -134,6 +139,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--llm-timeout", type=int, default=120, help="Timeout in seconds for each API request in API mode.")
     parser.add_argument("--llm-max-retries", type=int, default=3, help="Retry count for each API request in API mode.")
     parser.add_argument("--llm-max-topics", type=int, help="Optional limit for how many topics to analyze in API mode.")
+    parser.add_argument(
+        "--ai-cli-command",
+        help=(
+            "External AI CLI command for CLI mode. If the command contains {prompt}, it will be replaced by the prompt text. "
+            "If it contains {prompt_file}, it will be replaced by a temporary file path holding the prompt. "
+            "Otherwise the prompt will be passed via stdin."
+        ),
+    )
+    parser.add_argument("--ai-cli-timeout", type=int, default=DEFAULT_CLI_TIMEOUT, help="Timeout in seconds for each CLI call in CLI mode.")
+    parser.add_argument("--ai-cli-max-retries", type=int, default=2, help="Retry count for each CLI call in CLI mode.")
     return parser.parse_args()
 
 
@@ -627,6 +642,120 @@ def resolve_llm_settings(args: argparse.Namespace) -> dict[str, Any]:
 
 def llm_settings_ready(settings: dict[str, Any]) -> bool:
     return bool(settings["base_url"] and settings["model"] and settings["api_key"])
+
+
+def build_cli_prompt(packet: dict[str, Any]) -> str:
+    schema = json.dumps(build_ai_response_schema(), ensure_ascii=False, indent=2)
+    input_text = packet.get("agent_analysis_input") or ""
+    return "\n".join(
+        [
+            "你是一个严格输出 JSON 的判别器。请基于给定话题的标题和全帖内容做语义判断，不要依据标签，不要做关键词匹配替代理解。",
+            "只允许输出一个 JSON 对象，不要输出任何解释、Markdown、代码块或多余文本。",
+            "输出必须满足下面的 JSON Schema：",
+            schema,
+            "",
+            "输入如下：",
+            input_text,
+        ]
+    )
+
+
+def execute_ai_cli(prompt: str, args: argparse.Namespace) -> str:
+    command = (args.ai_cli_command or "").strip()
+    if not command:
+        raise ValueError("CLI mode requires --ai-cli-command.")
+
+    prompt_file_token = "{prompt_file}"
+    prompt_token = "{prompt}"
+    prompt_file_path: str | None = None
+
+    try:
+        if prompt_file_token in command:
+            with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", suffix=".txt") as fp:
+                fp.write(prompt)
+                prompt_file_path = fp.name
+            command = command.replace(prompt_file_token, prompt_file_path)
+            use_stdin = False
+        elif prompt_token in command:
+            command = command.replace(prompt_token, prompt)
+            use_stdin = False
+        else:
+            use_stdin = True
+
+        cmd_parts = shlex.split(command, posix=False)
+        completed = subprocess.run(
+            cmd_parts,
+            input=prompt if use_stdin else None,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            timeout=int(args.ai_cli_timeout),
+        )
+        stdout = (completed.stdout or "").strip()
+        stderr = (completed.stderr or "").strip()
+        if completed.returncode != 0:
+            raise RuntimeError(f"AI CLI exited with code {completed.returncode}. stderr={stderr[:500]}")
+        if not stdout:
+            raise RuntimeError(f"AI CLI returned empty output. stderr={stderr[:500]}")
+        return stdout
+    finally:
+        if prompt_file_path:
+            try:
+                Path(prompt_file_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def call_llm_for_packet_via_cli(packet: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    prompt = build_cli_prompt(packet)
+    retries = max(0, int(args.ai_cli_max_retries))
+    last_error: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            output = execute_ai_cli(prompt, args)
+            payload = parse_json_object_text(output)
+            return normalize_ai_result_record(packet, payload)
+        except Exception as exc:
+            last_error = exc
+            if attempt < retries:
+                time_module.sleep(1.5 * (attempt + 1))
+                continue
+            raise
+    raise RuntimeError(f"CLI analysis failed: {last_error}")
+
+
+def generate_ai_results_via_cli(
+    report: dict[str, Any],
+    args: argparse.Namespace,
+    output_path: Path,
+    json_path: Path,
+) -> tuple[dict[int, dict[str, Any]], Path]:
+    packets: list[dict[str, Any]] = report["analysis_packets"]
+    max_topics = args.llm_max_topics
+    if max_topics:
+        packets = packets[: int(max_topics)]
+
+    results: dict[int, dict[str, Any]] = {}
+    for packet in packets:
+        topic_id = int(packet["topic_id"])
+        result = call_llm_for_packet_via_cli(packet, args)
+        results[topic_id] = result
+
+    auto_results_path = output_path.with_name(output_path.stem + ".auto-ai-results.json")
+    payload = {
+        "meta": {
+            "source_excel": str(output_path),
+            "source_json": str(json_path),
+            "analysis_source": "script-cli",
+            "ai_mode_requested": args.ai_mode,
+            "ai_mode_resolved": "cli",
+            "topic_count": len(results),
+        },
+        "results": list(results.values()),
+    }
+    auto_results_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return results, auto_results_path
 
 
 def build_ai_response_schema() -> dict[str, Any]:
@@ -1491,6 +1620,12 @@ def main() -> None:
         report["auto_ai_results_path"] = str(auto_results_path)
         report["llm_provider"] = resolve_llm_settings(args)["provider"]
         report["llm_model"] = resolve_llm_settings(args)["model"]
+    elif args.ai_mode == "cli":
+        ai_results, auto_results_path = generate_ai_results_via_cli(report, args, output_path, json_path)
+        report["analysis_source"] = "script-cli"
+        report["ai_mode_resolved"] = "cli"
+        report["auto_ai_results_path"] = str(auto_results_path)
+        report["llm_provider"] = "cli"
     elif args.ai_mode == "auto":
         settings = resolve_llm_settings(args)
         if llm_settings_ready(settings):
@@ -1500,6 +1635,12 @@ def main() -> None:
             report["auto_ai_results_path"] = str(auto_results_path)
             report["llm_provider"] = settings["provider"]
             report["llm_model"] = settings["model"]
+        elif args.ai_cli_command:
+            ai_results, auto_results_path = generate_ai_results_via_cli(report, args, output_path, json_path)
+            report["analysis_source"] = "script-cli"
+            report["ai_mode_resolved"] = "cli-fallback"
+            report["auto_ai_results_path"] = str(auto_results_path)
+            report["llm_provider"] = "cli"
     if ai_results:
         report = apply_ai_results_to_report(report, ai_results, args.top_n)
     write_summary_workbook(report, output_path)
